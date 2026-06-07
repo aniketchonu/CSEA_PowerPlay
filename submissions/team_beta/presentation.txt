@@ -1,1 +1,52 @@
-.
+Presentation Notes
+1. Why CP-SAT
+Our motivation came from the nurse scheduling problem. In nurse scheduling you assign nurses to shifts over a planning horizon under hard constraints minimum rest periods, maximum consecutive shifts, legal hour limits and a soft objective around fairness and preference satisfaction. Our problem has exactly the same structure: matches are nurses, days are shifts, teams are staff with availability constraints.
+
+The nurse scheduling literature consistently uses constraint programming for this class of problem. The reason is that MIP solvers struggle when the LP relaxation is loose — and ours was extremely loose, a 97% gap between the upper bound and the best feasible solution. CP-SAT handles this better through two things:
+
+•Boolean reasoning : it can propagate constraints like no consecutive days natively through its SAT engine, cutting huge parts of the search space that MIP wastes time on
+•Portfolio search : 8 parallel workers each running a different strategy simultaneously. This is standard in nurse scheduling because no single search strategy works best across all instances
+
+2. Key Variables in the Model
+The model is built around one primary decision variable and several derived Boolean variables. The derived ones are necessary because the penalty terms need to know not just when matches happen but where teams are physically located and how they travel between venues.
+
+Variable	What it represents
+x[m, d]	: 1 if match m is on day d. The core decision — 56x56 = 3,136 binary variables.
+plays[team, d] :	1 if team plays on day d. Derived from x. Used for no-consecutive and balance constraints.
+on_alternate_venue[m] : 1 if match m is at the home team's alternate venue. Only for teams that have one.
+venue_of[m, v]	: 1 if match m is played at venue v. Derived from on_alternate_venue.
+team_at_venue_day[t,d,v]	: 1 if team t is at venue v on day d. Needed to calculate travel between matches.
+consec[t, d1, d2] :	1 if team t's consecutive matches are on d1 and d2 with nothing in between. Feeds every penalty term.
+trips[t, d1, d2, v1, v2]	: 1 if team t travelled from v1 to v2 between matches d1 and d2. Used for travel cost, distance fatigue, and equity.
+The trips variable is the most expensive roughly 420,000 Boolean variables just for travel legs. This is what caused the model to be too large to solve initially.
+
+3. The MAX_GAP Blunder
+What we did
+When we first ran the model, the presolve alone took over 300 seconds longer than the entire time limit so the solver never even started searching. The model had 2.65 million variables. To cut it down we set MAX_GAP = 9, meaning we only created consec and trips variables for match pairs where d2 - d1 < 9. This reduced variables by about 40% and made the model solvable.
+
+Why it was a blunder
+C5 penalises all consecutive match pairs where the gap deviates from the ideal 3 days. The penalty grows quadratically a gap of 14 days costs 0.15 x (14-3)^2 = 18.15 Cr per team. With MAX_GAP = 9, any gap of 9 or more days simply does not exist in our model. The consec variable is never created, the penalty is zero, and the solver happily schedules teams with 11 or 14-day idle stretches because it sees no cost for doing so.
+
+The checker applies the full C5 formula to all gaps regardless. So a schedule our model thought was worth 44 Cr (note: as seen in our model the actual checker score was deeply negative because of this blunder) scores as massively negative in reality because of the long gaps it had no incentive to avoid.
+
+The correct fix
+Remove MAX_GAP entirely and use LNS from the start. LNS freezes 80% of the schedule as hard constraints each iteration, which cuts the active variable count without truncating the penalty model. We did eventually implement LNS but only after this blunder had already corrupted the objective function for all the earlier runs.
+
+4. What Worked : Warm Start and LNS
+The warm start problem
+CP-SAT was spending nearly all of its 300-second budget just finding the first feasible solution, then running out of time. The initial naive warm start only hinted the x[m,d] variables 3,136 out of roughly 500,000. The solver had to infer all derived variables from scratch and got almost no benefit.
+
+After extending the hints to cover all 7 variable families around 430,000 hints the solver could start from a complete known-good assignment and spend the full budget on improvement. The progression was:
+
+•First feasible: 5 Cr net as seen in our model (solver spent 290 of 300 seconds just finding any valid schedule actual score negative)
+•After proper warm start: 27 Cr net as seen in our model (actual score negative)
+•After 4-hour iterative run: 44 Cr net as seen in our model (actual score negative all of these suffered from the MAX_GAP blunder)
+
+LNS keeping part of the schedule fixed
+After hitting the 44 Cr ceiling in our model we implemented Large Neighbourhood Search. Each iteration we froze 80% of the scheduled matches as hard constraints and only freed the remaining 20% for re-optimisation. CP-SAT then solved this much smaller subproblem in 120 seconds, and if it found a better assignment for those matches we saved it and used it as the next iteration's starting point.
+
+This is exactly the destroy-and-repair approach from the nurse scheduling literature. By fixing most of the schedule we massively reduce the search space while still allowing meaningful local improvements. The solver can focus entirely on a small neighbourhood rather than trying to rearrange everything at once.
+
+Running this LNS loop pushed the model objective from 44 Cr to 52 Cr as seen in our model. Again, the actual checker score for these schedules was negative due to the MAX_GAP issue the LNS itself was working correctly and finding genuine improvements within the (flawed) model's objective.
+
+We also noticed that multiple other teams independently converged to the same 44 Cr ceiling in their models, which suggests that this number may actually be close to the true optimum for this problem instance and the real-world answer is somewhere near there once the long-gap penalties are properly accounted for.
